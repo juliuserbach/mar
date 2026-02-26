@@ -51,6 +51,61 @@ class DiffLoss(nn.Module):
 
         return sampled_token_latent
 
+    def _prepare_t(self, t, batch_size, device):
+        if isinstance(t, int):
+            return torch.full((batch_size,), t, device=device, dtype=torch.long)
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"t must be an int or torch.Tensor, got {type(t)}")
+
+        if t.ndim == 0:
+            t = t.repeat(batch_size)
+        if t.shape[0] != batch_size:
+            raise ValueError(f"Expected t shape[0] == {batch_size}, got {t.shape[0]}")
+        return t.to(device=device, dtype=torch.long)
+
+    @staticmethod
+    def _broadcast_timesteps(values, ref):
+        while values.ndim < ref.ndim:
+            values = values.unsqueeze(-1)
+        return values
+
+    def predict_eps(self, x, t, z, cfg=1.0):
+        """
+        Predict epsilon for noisy sample x at discrete timestep t.
+        """
+        if x.shape[0] != z.shape[0]:
+            raise ValueError(f"Batch size mismatch: x has {x.shape[0]}, z has {z.shape[0]}")
+
+        t = self._prepare_t(t, x.shape[0], x.device)
+        if cfg != 1.0:
+            if x.shape[0] % 2 != 0:
+                raise ValueError("For cfg != 1.0, expected concatenated cond/uncond batch with even batch size.")
+            model_out = self.net.forward_with_cfg(x, t, c=z, cfg_scale=cfg)
+        else:
+            model_out = self.net(x, t, c=z)
+
+        eps = model_out[:, :self.in_channels]
+        return eps
+
+    def predict_velocity(self, x, t, z, cfg=1.0, eps=1e-12):
+        """
+        Predict probability-flow ODE velocity:
+            v_t = -0.5 * beta_t * (x_t - eps_theta / sigma_t)
+        where beta_t and sigma_t are from the training diffusion schedule.
+        """
+        eps_pred = self.predict_eps(x=x, t=t, z=z, cfg=cfg)
+        t = self._prepare_t(t, x.shape[0], x.device)
+
+        betas = torch.as_tensor(self.train_diffusion.betas, device=x.device, dtype=x.dtype)[t]
+        sigmas = torch.as_tensor(
+            self.train_diffusion.sqrt_one_minus_alphas_cumprod, device=x.device, dtype=x.dtype
+        )[t].clamp_min(eps)
+        betas = self._broadcast_timesteps(betas, x)
+        sigmas = self._broadcast_timesteps(sigmas, x)
+
+        velocity = -0.5 * betas * (x - (eps_pred / sigmas))
+        return velocity
+
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
