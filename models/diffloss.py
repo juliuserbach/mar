@@ -1,9 +1,14 @@
 import torch
 import torch.nn as nn
+from torch.func import functional_call, grad as func_grad, jacfwd, jacrev, vmap
 from torch.utils.checkpoint import checkpoint
 import math
 
-from diffusion import create_diffusion
+try:
+    # Package import path used from kosmos.
+    from external.mar.diffusion import create_diffusion
+except Exception:  # pragma: no cover - fallback for original MAR scripts
+    from diffusion import create_diffusion
 
 
 class DiffLoss(nn.Module):
@@ -22,6 +27,8 @@ class DiffLoss(nn.Module):
 
         self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine")
         self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
+        self._compiled_sample_with_log_prob = {}
+        self._compiled_log_prob = {}
 
     def forward(self, target, z, mask=None):
         t = torch.randint(0, self.train_diffusion.num_timesteps, (target.shape[0],), device=target.device)
@@ -34,13 +41,14 @@ class DiffLoss(nn.Module):
 
     def sample(self, z, temperature=1.0, cfg=1.0):
         # diffusion loss sampling
+        device = z.device
         if not cfg == 1.0:
-            noise = torch.randn(z.shape[0] // 2, self.in_channels).cuda()
+            noise = torch.randn(z.shape[0] // 2, self.in_channels, device=device)
             noise = torch.cat([noise, noise], dim=0)
             model_kwargs = dict(c=z, cfg_scale=cfg)
             sample_fn = self.net.forward_with_cfg
         else:
-            noise = torch.randn(z.shape[0], self.in_channels).cuda()
+            noise = torch.randn(z.shape[0], self.in_channels, device=device)
             model_kwargs = dict(c=z)
             sample_fn = self.net.forward
 
@@ -61,7 +69,11 @@ class DiffLoss(nn.Module):
             t = t.repeat(batch_size)
         if t.shape[0] != batch_size:
             raise ValueError(f"Expected t shape[0] == {batch_size}, got {t.shape[0]}")
-        return t.to(device=device, dtype=torch.long)
+        t = t.to(device=device)
+        if t.is_floating_point():
+            if t.numel() > 0 and float(t.min().item()) >= 0.0 and float(t.max().item()) <= 1.0:
+                t = torch.round(t * (self.train_diffusion.num_timesteps - 1))
+        return t.to(dtype=torch.long)
 
     @staticmethod
     def _broadcast_timesteps(values, ref):
@@ -105,6 +117,162 @@ class DiffLoss(nn.Module):
 
         velocity = -0.5 * betas * (x - (eps_pred / sigmas))
         return velocity
+
+    def _predict_velocity(self, x, t, z):
+        return self.predict_velocity(x=x, t=t, z=z, cfg=1.0)
+
+    def _exact_divergence(self, x, t, z, use_jacfwd: bool = True):
+        def single_vf(x_single, t_single, z_single):
+            x_single = x_single.unsqueeze(0)
+            t_single = t_single.view(1)
+            z_single = z_single.unsqueeze(0)
+            return self._predict_velocity(x_single, t_single, z_single).squeeze(0)
+
+        jac_fn = jacfwd if use_jacfwd else jacrev
+        jac = vmap(jac_fn(single_vf), in_dims=(0, 0, 0))(x, t, z)
+        return jac.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+    def _hutchinson_divergence(
+        self,
+        x,
+        t,
+        z,
+        num_samples: int = 1,
+        noise_type: str = "rademacher",
+    ):
+        if noise_type == "rademacher":
+            v = torch.randint(
+                0, 2, (num_samples, *x.shape), device=x.device, dtype=x.dtype
+            ) * 2 - 1
+        elif noise_type == "gaussian":
+            v = torch.randn((num_samples, *x.shape), device=x.device, dtype=x.dtype)
+        else:
+            raise ValueError(f"Unknown noise_type: {noise_type}.")
+
+        x = x.detach()
+        t = t.detach()
+        z = z.detach()
+
+        params = dict(self.net.named_parameters())
+        buffers = dict(self.net.named_buffers())
+        params_and_buffers = {**params, **buffers}
+
+        def net_velocity(x_in, t_in, z_in):
+            model_out = functional_call(self.net, params_and_buffers, (x_in, t_in, z_in))
+            eps = model_out[:, :self.in_channels]
+            t_idx = self._prepare_t(t_in, x_in.shape[0], x_in.device)
+            betas = torch.as_tensor(self.train_diffusion.betas, device=x_in.device, dtype=x_in.dtype)[t_idx]
+            sigmas = torch.as_tensor(
+                self.train_diffusion.sqrt_one_minus_alphas_cumprod,
+                device=x_in.device,
+                dtype=x_in.dtype,
+            )[t_idx].clamp_min(1e-12)
+            while betas.ndim < x_in.ndim:
+                betas = betas.unsqueeze(-1)
+                sigmas = sigmas.unsqueeze(-1)
+            return -0.5 * betas * (x_in - (eps / sigmas))
+
+        def v_dot_velocity(x_in, t_in, z_in, v_in):
+            return (v_in * net_velocity(x_in, t_in, z_in)).sum()
+
+        vjp_fn = func_grad(v_dot_velocity, argnums=0)
+        vjp = vmap(vjp_fn, in_dims=(None, None, None, 0))(x, t, z, v)
+        div_estimate = (v * vjp).sum(dim=-1)
+        return div_estimate.mean(dim=0)
+
+    def sample_with_log_prob(
+        self,
+        z,
+        cfg: float = 1.0,
+        use_jacfwd: bool = True,
+        divergence_method: str = "exact",
+        hutchinson_noise_type: str = "rademacher",
+        hutchinson_samples: int = 1,
+        noise: torch.Tensor | None = None,
+    ):
+        if cfg != 1.0:
+            raise ValueError("sample_with_log_prob currently supports cfg=1.0 only.")
+        device = z.device
+        if noise is None:
+            x = torch.randn(z.shape[0], self.in_channels, device=device)
+        else:
+            if noise.shape != (z.shape[0], self.in_channels):
+                raise ValueError(
+                    "noise must have shape (B, in_channels). "
+                    f"Got noise={tuple(noise.shape)}, z={tuple(z.shape)}, "
+                    f"in_channels={self.in_channels}."
+                )
+            x = noise.to(device=device)
+
+        log2pi = math.log(2.0 * math.pi)
+        logp = -0.5 * (x.pow(2).sum(dim=-1) + self.in_channels * log2pi)
+        t = torch.linspace(1.0, 0.0, self.gen_diffusion.num_timesteps + 1, device=device)
+        for i in range(self.gen_diffusion.num_timesteps):
+            t_cur, t_next = t[i], t[i + 1]
+            t_batch = t_cur.expand(x.shape[0])
+            with torch.enable_grad():
+                if divergence_method == "exact":
+                    trace = self._exact_divergence(x, t_batch, z, use_jacfwd=use_jacfwd)
+                elif divergence_method == "hutchinson":
+                    trace = self._hutchinson_divergence(
+                        x,
+                        t_batch,
+                        z,
+                        num_samples=hutchinson_samples,
+                        noise_type=hutchinson_noise_type,
+                    )
+                else:
+                    raise ValueError(f"Unknown divergence_method: {divergence_method}.")
+            with torch.no_grad():
+                velocity = self._predict_velocity(x, t_batch, z)
+            dt = t_next - t_cur
+            logp = logp + dt * (-trace)
+            x = x + dt * velocity
+        return x, logp
+
+    def sample_with_log_prob_compiled(self, *args, **kwargs):
+        return self.sample_with_log_prob(*args, **kwargs)
+
+    def log_prob(
+        self,
+        x,
+        z,
+        use_jacfwd: bool = True,
+        divergence_method: str = "exact",
+        hutchinson_noise_type: str = "rademacher",
+        hutchinson_samples: int = 1,
+    ):
+        device = z.device
+        x = x.to(device=device).clone()
+        t = torch.linspace(0.0, 1.0, self.gen_diffusion.num_timesteps + 1, device=device)
+        logp_correction = torch.zeros(x.shape[0], device=device, dtype=x.dtype)
+        for i in range(self.gen_diffusion.num_timesteps):
+            t_cur, t_next = t[i], t[i + 1]
+            t_batch = t_cur.expand(x.shape[0])
+            with torch.enable_grad():
+                if divergence_method == "exact":
+                    trace = self._exact_divergence(x, t_batch, z, use_jacfwd=use_jacfwd)
+                elif divergence_method == "hutchinson":
+                    trace = self._hutchinson_divergence(
+                        x,
+                        t_batch,
+                        z,
+                        num_samples=hutchinson_samples,
+                        noise_type=hutchinson_noise_type,
+                    )
+                else:
+                    raise ValueError(f"Unknown divergence_method: {divergence_method}.")
+            dt = t_next - t_cur
+            logp_correction = logp_correction + dt * trace
+            with torch.no_grad():
+                velocity = self._predict_velocity(x, t_batch, z)
+                x = x + dt * velocity
+        log2pi = math.log(2.0 * math.pi)
+        logp_noise = -0.5 * (x.pow(2).sum(dim=-1) + self.in_channels * log2pi)
+        return logp_noise + logp_correction
+
+    def log_prob_compiled(self, *args, **kwargs):
+        return self.log_prob(*args, **kwargs)
 
 
 def modulate(x, shift, scale):

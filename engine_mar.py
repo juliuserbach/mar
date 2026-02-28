@@ -248,3 +248,82 @@ def cache_latents(vae,
             torch.cuda.synchronize()
 
     return
+
+
+def cache_latents_wds(
+    vae,
+    data_loader: Iterable,
+    device: torch.device,
+    args=None,
+):
+    try:
+        import webdataset as wds
+    except ImportError as exc:
+        raise ImportError(
+            "webdataset is required for WDS latent caching. Install with: pip install webdataset"
+        ) from exc
+
+    if args is None or not getattr(args, "cached_path", ""):
+        raise ValueError("args.cached_path must be set for WDS latent caching.")
+
+    os.makedirs(args.cached_path, exist_ok=True)
+    samples_per_shard = int(getattr(args, "samples_per_shard", 1000))
+    latent_dtype_str = str(getattr(args, "wds_latent_dtype", "float16")).lower()
+    if latent_dtype_str not in {"float16", "float32"}:
+        raise ValueError("wds_latent_dtype must be 'float16' or 'float32'.")
+    latent_dtype = np.float16 if latent_dtype_str == "float16" else np.float32
+
+    rank = misc.get_rank()
+    world_size = misc.get_world_size()
+    if world_size > 1:
+        shard_pattern = os.path.join(args.cached_path, f"rank{rank:05d}-%06d.tar")
+    else:
+        shard_pattern = os.path.join(args.cached_path, "shard-%06d.tar")
+
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = "Caching WDS: "
+    print_freq = 20
+
+    sample_count = 0
+    with wds.ShardWriter(shard_pattern, maxcount=samples_per_shard) as sink:
+        for data_iter_step, (samples, labels, paths) in enumerate(
+            metric_logger.log_every(data_loader, print_freq, header)
+        ):
+            samples = samples.to(device, non_blocking=True)
+
+            with torch.no_grad():
+                posterior = vae.encode(samples)
+                moments = posterior.parameters
+                posterior_flip = vae.encode(samples.flip(dims=[3]))
+                moments_flip = posterior_flip.parameters
+
+            moments_np = moments.detach().cpu().numpy().astype(latent_dtype, copy=False)
+            moments_flip_np = moments_flip.detach().cpu().numpy().astype(latent_dtype, copy=False)
+
+            if torch.is_tensor(labels):
+                labels_list = labels.detach().cpu().tolist()
+            else:
+                labels_list = list(labels)
+
+            for i, path in enumerate(paths):
+                path_str = str(path).replace("\\", "/")
+                safe_key = path_str.replace("/", "_")
+                key = f"{safe_key}_{sample_count:09d}"
+                sample = {
+                    "__key__": key,
+                    "moments.npy": moments_np[i],
+                    "moments_flip.npy": moments_flip_np[i],
+                    "path.txt": path_str,
+                    "meta.json": {"path": path_str},
+                }
+
+                if i < len(labels_list):
+                    sample["cls.npy"] = np.asarray(int(labels_list[i]), dtype=np.int64)
+
+                sink.write(sample)
+                sample_count += 1
+
+            if misc.is_dist_avail_and_initialized() and device.type == "cuda":
+                torch.cuda.synchronize(device=device)
+
+    return

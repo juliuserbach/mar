@@ -14,7 +14,7 @@ import util.misc as misc
 from util.loader import ImageFolderWithFilename
 
 from models.vae import AutoencoderKL
-from engine_mar import cache_latents
+from engine_mar import cache_latents, cache_latents_wds
 
 from util.crop import center_crop_arr
 
@@ -54,6 +54,24 @@ def get_args_parser():
 
     # caching latents
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    parser.add_argument(
+        '--cache_format',
+        default='npz',
+        choices=['npz', 'wds'],
+        help='cache output format',
+    )
+    parser.add_argument(
+        '--samples_per_shard',
+        default=1000,
+        type=int,
+        help='number of samples per tar shard when cache_format=wds',
+    )
+    parser.add_argument(
+        '--wds_latent_dtype',
+        default='float16',
+        choices=['float16', 'float32'],
+        help='latent dtype stored inside WDS shards',
+    )
 
     return parser
 
@@ -101,17 +119,31 @@ def main(args):
     )
 
     # define the vae
-    vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    vae = AutoencoderKL(
+        embed_dim=args.vae_embed_dim,
+        ch_mult=(1, 1, 2, 2, 4),
+        ckpt_path=args.vae_path,
+    ).to(device).eval()
 
     # training
-    print(f"Start caching VAE latents")
+    if args.cached_path:
+        os.makedirs(args.cached_path, exist_ok=True)
+    print(f"Start caching VAE latents (format={args.cache_format})")
     start_time = time.time()
-    cache_latents(
-        vae,
-        data_loader_train,
-        device,
-        args=args
-    )
+    if args.cache_format == 'wds':
+        cache_latents_wds(
+            vae,
+            data_loader_train,
+            device,
+            args=args
+        )
+    else:
+        cache_latents(
+            vae,
+            data_loader_train,
+            device,
+            args=args
+        )
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Caching time {}'.format(total_time_str))
